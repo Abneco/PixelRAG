@@ -31,9 +31,16 @@ except ImportError:
     HttpOptions = None
     Content = None
 
+from .model_config import MINIMAX_ENDPOINTS, MINIMAX_MODELS
 from .retrieval import RetrievalResult
 
 logger = logging.getLogger(__name__)
+
+
+def _minimax_key(model: str) -> str:
+    """Registry key for a model name, matching get_model_config's lookup."""
+    return model.lower().rsplit("/", 1)[-1]
+
 
 # Some modern reasoning models deprecate `temperature` (Claude Opus 4.7+, some
 # GPT-5 variants). Both backend paths consult this list, so a newly released
@@ -381,7 +388,7 @@ def _encode_images_to_content(
 def build_react_messages(
     query: str,
     retrieval_results: list[RetrievalResult],
-    assistant_responses: list[str],
+    assistant_responses: list[str | dict],
     encode_image_fn=None,
     prompt_version: str = "v1",
     is_last_turn: bool = False,
@@ -453,8 +460,11 @@ def build_react_messages(
 
         # Add assistant response if we have one for this turn
         if turn_idx < len(assistant_responses):
+            response = assistant_responses[turn_idx]
             messages.append(
-                {"role": "assistant", "content": assistant_responses[turn_idx]}
+                response
+                if isinstance(response, dict)
+                else {"role": "assistant", "content": response}
             )
 
     return messages
@@ -487,6 +497,26 @@ class LLMClient:
         # Kept for the LiteLLM path (module-level SDK, no persistent client object).
         self.api_key = api_key
         self.api_base = api_base
+        # Match the same way get_model_config does -- on the last path segment --
+        # so a vendor-prefixed spelling like "MiniMax/MiniMax-M3.1-Flash" (used by
+        # this module's own tests) resolves identically here and at the
+        # assistant-message branch in _generate_openai. Comparing the bare string
+        # made the two disagree: is_direct_minimax was False while the message
+        # branch fired, so Flash silently got the legacy thinking payload.
+        self.is_direct_minimax = (
+            not use_litellm
+            and _minimax_key(model) in MINIMAX_MODELS
+            and (api_base or "").rstrip("/")
+            in {endpoint["api_base"] for endpoint in MINIMAX_ENDPOINTS.values()}
+        )
+        if (
+            self.is_direct_minimax
+            and _minimax_key(model) == "minimax-m3.1-flash"
+            and enable_thinking is False
+        ):
+            raise ValueError(
+                "MiniMax-M3.1-Flash requires adaptive thinking; omit --no-think."
+            )
         print(f"context length model: {max_context_tokens}")
 
         # LiteLLM routes every provider through one SDK call using a
@@ -748,9 +778,16 @@ class LLMClient:
         if not drops_temperature:
             kwargs["temperature"] = self.temperature
         if self.enable_thinking is not None:
-            kwargs["extra_body"] = {
-                "chat_template_kwargs": {"enable_thinking": self.enable_thinking}
-            }
+            if self.is_direct_minimax:
+                kwargs["extra_body"] = {
+                    "thinking": {
+                        "type": "adaptive" if self.enable_thinking else "disabled"
+                    }
+                }
+            else:
+                kwargs["extra_body"] = {
+                    "chat_template_kwargs": {"enable_thinking": self.enable_thinking}
+                }
         response = await self.client.chat.completions.create(**kwargs)
 
         generated_text = response.choices[0].message.content
@@ -762,6 +799,16 @@ class LLMClient:
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
             }
+
+        if _minimax_key(self.model) in MINIMAX_MODELS:
+            # ReAct must replay Flash's separate reasoning_content together with
+            # the assistant content and any tool calls, not just the answer text.
+            # Underscore-prefixed: `usage` is serialized verbatim as each
+            # record's token accounting, so anything here that is not a token
+            # count must be strippable. run_bench drops _-keys before writing.
+            usage["_assistant_message"] = response.choices[0].message.model_dump(
+                exclude_none=True
+            )
 
         return generated_text, usage
 
